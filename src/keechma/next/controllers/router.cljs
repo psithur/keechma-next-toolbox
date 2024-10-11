@@ -1,9 +1,10 @@
 (ns keechma.next.controllers.router
   (:require [keechma.next.controller :as ctrl]
+            [clojure.string]
             [router.v2.core :as router]
-            [goog.events :as events]
             [goog.history.EventType :as EventType]
             [keechma.next.protocols :as keechma-pt]
+            [oops.core :refer [ocall ocall+]]
             [keechma.next.controllers.router.protocols :as pt :refer [IRouterApi]]
             [keechma.next.toolbox.event :as event])
   (:import goog.History))
@@ -15,25 +16,25 @@
             (.getElementById js/document "history_state0")
             (.getElementById js/document "history_iframe0")))
 
-(defn get-route [routes url]
-  (let [clean-url (subs url 1)]
-    (router/url->map routes clean-url)))
-
-(defn url-with-hashbang [url]
-  (str "#!" url))
+(defn url-no-hashbang [url]
+  (str "/a/" url))
 
 (defn map->url [routes params]
   (->> params
        (router/map->url routes)
-       url-with-hashbang))
+       url-no-hashbang))
 
 (defn bind-listener [ctrl routes]
   (let [history (get-history)
-        handler #(ctrl/handle ctrl :keechma.router.on/route-change (get-route routes ^js/String (.-token %)))]
-    (events/listen history EventType/NAVIGATE handler)
+        handler #(ctrl/handle ctrl :keechma.router.on/route-change (router/url->map routes ^js/String (.-state %)))
+        listener (.addEventListener
+                   js/window
+                   "popstate"
+                   handler)]
+
     (.setEnabled history true)
     (fn []
-      (events/unlisten history EventType/NAVIGATE handler))))
+      (.removeEventListener js/window "popstate" listener))))
 
 (defn default-router-processor [next-params _]
   next-params)
@@ -52,31 +53,39 @@
 (defmethod ctrl/api :keechma/router [ctrl]
   (let [params-processor (get-params-processor ctrl)
         routes (::routes ctrl)
-        state* (:state* ctrl)]
+        state* (:state* ctrl)
+        do-transition (fn [hfn payload]
+                        (let [transaction
+                              (fn []
+                                  ;; Do a double conversion payload -> url -> url-payload
+                                  ;; to get the identical result to one we would get if the
+                                  ;; user clicked on the link
+                                  (let [url (->> payload params-processor (router/map->url routes))
+                                        url-payload (router/url->map routes url)]
+                                    (ocall+ js/history hfn url "" (url-no-hashbang url))
+                                    (reset! state* url-payload)))]
+                          (ctrl/transact ctrl transaction)))]
+
     (reify
       IRouterApi
       (redirect! [_ payload]
-        (ctrl/transact ctrl (fn [] (set! (.-hash js/location) (->> payload params-processor (map->url routes))))))
+        (do-transition "pushState" payload))
       (replace! [_ payload]
-        (let [transaction (fn []
-                            ;; Do a double conversion payload -> url -> url-payload
-                            ;; to get the identical result to one we would get if the
-                            ;; user clicked on the link
-                            (let [url (->> payload params-processor (router/map->url routes))
-                                  url-payload (router/url->map routes url)]
-
-                              (.replaceState js/history nil "" (url-with-hashbang url))
-                              (reset! state* url-payload)))]
-          (ctrl/transact ctrl transaction)))
+        (do-transition "replaceState" payload))
+      (update! [_ payload]
+        (do-transition "replaceState" (merge (:data @state*) payload)))
       (back! [_]
         (.back js/history))
       (get-url [_ params]
         (->> params params-processor (map->url routes))))))
 
 (defmethod ctrl/start :keechma/router [ctrl]
-  (let [url (subs (.. js/window -location -hash) 2)
+  (let [url (subs (.. js/window -location -pathname) 3)
+        params (.. js/window -location -search)
+        full (str url params)
         routes (::routes ctrl)]
-    (router/url->map routes url)))
+    (ocall+ js/history "replaceState" full "" (url-no-hashbang full))
+    (router/url->map routes full)))
 
 (defmethod ctrl/handle :keechma/router [{:keys [state*] :as ctrl} cmd payload]
   (let [params-processor (get-params-processor ctrl)
@@ -100,6 +109,7 @@
 
 (def redirect! (make-api-proxy pt/redirect!))
 (def replace! (make-api-proxy pt/replace!))
+(def update! (make-api-proxy pt/update!))
 (def back! (make-api-proxy pt/back!))
 (def get-url (make-api-proxy pt/get-url))
 
